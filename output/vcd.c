@@ -22,6 +22,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <glib.h>
+#include <ctype.h>
 #include "config.h" /* Needed for PACKAGE and others. */
 #include "libsigrok.h"
 #include "libsigrok-internal.h"
@@ -35,15 +36,78 @@
 #define sr_warn(s, args...) sr_warn(LOG_PREFIX s, ## args)
 #define sr_err(s, args...) sr_err(LOG_PREFIX s, ## args)
 
+struct bit_index {
+	int bit;
+	int sample;
+};
+
+struct probe_context {
+	GArray *indices;
+	char symbol;
+	char *name;
+	gboolean is_vector;
+};
+
 struct context {
-	int num_enabled_probes;
 	GArray *probeindices;
 	GString *header;
 	uint8_t *prevsample;
 	int period;
 	uint64_t samplerate;
 	unsigned int unitsize;
+	uint64_t samplecount;
 };
+
+static char *get_array_str(const char *str, int *idx)
+{
+	char *ret;
+	int end;
+
+	end = strlen(str) - 1;
+
+	/* Ends in '>' */
+	if (str[end--] != '>')
+		return NULL;
+
+	/* Contains at least one digit before '>' */
+	if (end <= 0 || !isdigit(str[end]))
+		return NULL;
+
+	while (end > 0 && isdigit(str[end]))
+		end--;
+
+	/* Has a '<' and at least one character before it */
+	if (!end || str[end] != '<')
+		return NULL;
+
+	*idx = strtoul(str + end + 1, NULL, 10);
+
+	ret = g_strdup(str);
+	if (!ret)
+		return NULL;
+
+	ret[end] = '\0';
+	return ret;
+}
+
+static struct probe_context *probe_find(GArray *indices, const char *name)
+{
+	unsigned int i;
+	for (i = 0; i < indices->len; i++) {
+		struct probe_context *ctx;
+		ctx = &g_array_index(indices, struct probe_context, i);
+		if (ctx->is_vector && !strcmp(ctx->name, name))
+			return ctx;
+	}
+	return NULL;
+}
+
+static gint sort_bits(gconstpointer _a, gconstpointer _b)
+{
+	const struct bit_index *a = _a;
+	const struct bit_index *b = _b;
+	return a->bit == b->bit ? 0 : (a->bit < b->bit ? 1 : -1);
+}
 
 static const char *vcd_header_comment = "\
 $comment\n  Acquisition with %d/%d probes at %s\n$end\n";
@@ -54,33 +118,58 @@ static int init(struct sr_output *o)
 	struct sr_probe *probe;
 	GSList *l;
 	GVariant *gvar;
-	int num_probes, i;
+	int num_probes;
 	char *samplerate_s, *frequency_s, *timestamp;
+	int num_enabled_probes = 0;
 	time_t t;
+	unsigned int i;
 
-	if (!(ctx = g_try_malloc0(sizeof(struct context)))) {
-		sr_err("%s: ctx malloc failed", __func__);
-		return SR_ERR_MALLOC;
-	}
+	ctx = g_malloc0(sizeof(struct context));
 
 	o->internal = ctx;
-	ctx->num_enabled_probes = 0;
-	ctx->probeindices = g_array_new(FALSE, FALSE, sizeof(int));
+	ctx->probeindices = g_array_new(FALSE, TRUE,
+						sizeof(struct probe_context));
 
 	for (l = o->sdi->probes; l; l = l->next) {
+		char *array_str;
+		struct probe_context *probe_ctx;
+		struct bit_index bidx;
 		probe = l->data;
 		if (!probe->enabled)
 			continue;
-		ctx->probeindices = g_array_append_val(
-				ctx->probeindices, probe->index);
-		ctx->num_enabled_probes++;
+		bidx.bit = 0;
+		bidx.sample = ctx->probeindices->len;
+		array_str = get_array_str(probe->name, &bidx.bit);
+		if (array_str) {
+			probe_ctx = probe_find(ctx->probeindices, array_str);
+			if (probe_ctx)
+				g_free(array_str);
+		} else
+			probe_ctx = NULL;
+		if (!probe_ctx) {
+			ctx->probeindices = g_array_set_size(
+					ctx->probeindices,
+					ctx->probeindices->len + 1);
+			probe_ctx = &g_array_index(ctx->probeindices,
+					struct probe_context,
+					ctx->probeindices->len - 1);
+			probe_ctx->name = array_str ? : probe->name;
+			probe_ctx->symbol = '!' + ctx->probeindices->len - 1;
+			probe_ctx->indices = g_array_new(FALSE, FALSE,
+							sizeof(bidx));
+			probe_ctx->is_vector = array_str != NULL;
+		}
+		probe_ctx->indices = g_array_append_val(probe_ctx->indices,
+								bidx);
+		num_enabled_probes++;
 	}
-	if (ctx->num_enabled_probes > 94) {
+
+	if (ctx->probeindices->len > 94) {
 		sr_err("VCD only supports 94 probes.");
 		return SR_ERR;
 	}
 
-	ctx->unitsize = (ctx->num_enabled_probes + 7) / 8;
+	ctx->unitsize = (ctx->probeindices->len + 7) / 8;
 	ctx->header = g_string_sized_new(512);
 	num_probes = g_slist_length(o->sdi->probes);
 
@@ -99,13 +188,9 @@ static int init(struct sr_output *o)
 			&gvar) == SR_OK) {
 		ctx->samplerate = g_variant_get_uint64(gvar);
 		g_variant_unref(gvar);
-		if (!((samplerate_s = sr_samplerate_string(ctx->samplerate)))) {
-			g_string_free(ctx->header, TRUE);
-			g_free(ctx);
-			return SR_ERR;
-		}
+		samplerate_s = sr_samplerate_string(ctx->samplerate);
 		g_string_append_printf(ctx->header, vcd_header_comment,
-				 ctx->num_enabled_probes, num_probes, samplerate_s);
+				 num_enabled_probes, num_probes, samplerate_s);
 		g_free(samplerate_s);
 	}
 
@@ -117,11 +202,7 @@ static int init(struct sr_output *o)
 		ctx->period = SR_MHZ(1);
 	else
 		ctx->period = SR_KHZ(1);
-	if (!(frequency_s = sr_period_string(ctx->period))) {
-		g_string_free(ctx->header, TRUE);
-		g_free(ctx);
-		return SR_ERR;
-	}
+	frequency_s = sr_period_string(ctx->period);
 	g_string_append_printf(ctx->header, "$timescale %s $end\n", frequency_s);
 	g_free(frequency_s);
 
@@ -129,25 +210,30 @@ static int init(struct sr_output *o)
 	g_string_append_printf(ctx->header, "$scope module %s $end\n", PACKAGE);
 
 	/* Wires / channels */
-	for (i = 0, l = o->sdi->probes; l; l = l->next, i++) {
-		probe = l->data;
-		if (!probe->enabled)
-			continue;
-		g_string_append_printf(ctx->header, "$var wire 1 %c %s $end\n",
-				(char)('!' + i), probe->name);
+	for (i = 0; i < ctx->probeindices->len; i++) {
+		struct probe_context *probe_ctx;
+		probe_ctx = &g_array_index(ctx->probeindices,
+				struct probe_context, i);
+		g_string_append_printf(ctx->header, "$var wire %d %c %s $end\n",
+				probe_ctx->indices->len, probe_ctx->symbol,
+				probe_ctx->name);
+		/* Sort from highest bit to lowest for easy output */
+		g_array_sort(probe_ctx->indices, sort_bits);
+		if (probe_ctx->is_vector)
+			g_free(probe_ctx->name);
 	}
 
 	g_string_append(ctx->header, "$upscope $end\n"
-			"$enddefinitions $end\n$dumpvars\n");
+			"$enddefinitions $end\n");
 
-	if (!(ctx->prevsample = g_try_malloc0(ctx->unitsize))) {
-		g_string_free(ctx->header, TRUE);
-		g_free(ctx);
-		sr_err("%s: ctx->prevsample malloc failed", __func__);
-		return SR_ERR_MALLOC;
-	}
+	ctx->prevsample = g_malloc0(ctx->unitsize);
 
 	return SR_OK;
+}
+
+static int get_bit(uint8_t *bit_array, int idx)
+{
+	return !!(bit_array[idx / 8] & (((uint8_t) 1) << idx));
 }
 
 static int receive(struct sr_output *o, const struct sr_dev_inst *sdi,
@@ -156,9 +242,9 @@ static int receive(struct sr_output *o, const struct sr_dev_inst *sdi,
 	const struct sr_datafeed_logic *logic;
 	struct context *ctx;
 	unsigned int i;
-	int p, curbit, prevbit, index;
+	int curbit, prevbit;
 	uint8_t *sample;
-	static uint64_t samplecount = 0;
+	int first;
 
 	(void)sdi;
 
@@ -167,41 +253,89 @@ static int receive(struct sr_output *o, const struct sr_dev_inst *sdi,
 		return SR_ERR_ARG;
 	ctx = o->internal;
 
-	if (packet->type == SR_DF_END) {
-		*out = g_string_new("$dumpoff\n$end\n");
-		return SR_OK;
-	} else if (packet->type != SR_DF_LOGIC)
+	if (packet->type != SR_DF_LOGIC)
 		return SR_OK;
 
-	if (ctx->header) {
-		/* The header is still here, this must be the first packet. */
+	/* The header is still here, this must be the first packet. */
+	first = ctx->header != NULL;
+
+	if (first) {
 		*out = ctx->header;
 		ctx->header = NULL;
-	} else {
+	} else
 		*out = g_string_sized_new(512);
-	}
 
 	logic = packet->payload;
 	for (i = 0; i <= logic->length - logic->unitsize; i += logic->unitsize) {
-		samplecount++;
+		unsigned int p;
+
+		ctx->samplecount++;
 
 		sample = logic->data + i;
 
-		for (p = 0; p < ctx->num_enabled_probes; p++) {
-			index = g_array_index(ctx->probeindices, int, p);
-			curbit = (sample[p / 8] & (((uint8_t) 1) << index)) >> index;
-			prevbit = (ctx->prevsample[p / 8] & (((uint8_t) 1) << index)) >> index;
+		if (!first && !memcmp(ctx->prevsample, sample, ctx->unitsize))
+			continue;
 
-			/* VCD only contains deltas/changes of signals. */
-			if (prevbit == curbit)
+		g_string_append_printf(*out, "#%" PRIu64 "\n",
+				(uint64_t)(((float)ctx->samplecount / ctx->samplerate)
+				* ctx->period));
+
+		/*
+		 * For first pass, output a dumpvars will the values of all
+		 * the variables.
+		 */
+		if (first)
+			g_string_append(*out, "$dumpvars\n");
+
+		for (p = 0; p < ctx->probeindices->len; p++) {
+			struct probe_context *probe_ctx;
+			unsigned int s;
+			int b;
+			int last_bit;
+
+			probe_ctx = &g_array_index(ctx->probeindices,
+					struct probe_context, p);
+			/*
+			 * Look for any changed bits for this array (or bit),
+			 * VCD only contains deltas/changes of signals.
+			 */
+			for (s = 0; s < probe_ctx->indices->len; s++) {
+				struct bit_index *bidx;
+				bidx = &g_array_index(probe_ctx->indices,
+						struct bit_index, s);
+				curbit = get_bit(sample, bidx->sample);
+				prevbit = get_bit(ctx->prevsample, bidx->sample);
+				if (prevbit != curbit)
+					break;
+			}
+			if (!first && s != probe_ctx->indices->len)
+				/* no changes */
 				continue;
 
-			/* Output which signal changed to which value. */
-			g_string_append_printf(*out, "#%" PRIu64 "\n%i%c\n",
-					(uint64_t)(((float)samplecount / ctx->samplerate)
-					* ctx->period), curbit, (char)('!' + p));
+			if (probe_ctx->is_vector)
+				g_string_append_c(*out, 'b');
+			last_bit = 0;
+			for (s = 0; s < probe_ctx->indices->len; s++) {
+				struct bit_index *bidx;
+				bidx = &g_array_index(probe_ctx->indices,
+						struct bit_index, s);
+				/* Fill in spaces between known bits */
+				for (b = last_bit - 1; b > bidx->bit; b--)
+					g_string_append_c(*out, 'x');
+				curbit = get_bit(sample, bidx->sample);
+				g_string_append_printf(*out, "%i", curbit);
+			}
+			/* Fill in spaces after final known bits */
+			for (b = last_bit - 1; b >= 0; b--)
+				g_string_append_c(*out, 'x');
+			if (probe_ctx->is_vector)
+				g_string_append_c(*out, ' ');
+			g_string_append_printf(*out, "%c\n", probe_ctx->symbol);
 		}
 
+		if (first)
+			g_string_append(*out, "$end\n");
+		first = FALSE;
 		memcpy(ctx->prevsample, sample, ctx->unitsize);
 	}
 
@@ -211,11 +345,20 @@ static int receive(struct sr_output *o, const struct sr_dev_inst *sdi,
 static int cleanup(struct sr_output *o)
 {
 	struct context *ctx;
+	unsigned int i;
 
 	if (!o || !o->internal)
 		return SR_ERR_ARG;
 
 	ctx = o->internal;
+
+	for (i = 0; i < ctx->probeindices->len; i++) {
+		struct probe_context *probe_ctx;
+		probe_ctx = &g_array_index(ctx->probeindices,
+				struct probe_context, i);
+		g_array_free(probe_ctx->indices, TRUE);
+	}
+	g_array_free(ctx->probeindices, TRUE);
 	g_free(ctx);
 
 	return SR_OK;
